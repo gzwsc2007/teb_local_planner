@@ -147,9 +147,24 @@ void TebLocalPlannerROS::initialize(std::string name, tf::TransformListener* tf,
       ROS_INFO("No costmap conversion plugin specified. All occupied costmap cells are treaten as point obstacles.");
   
     
-    // Get footprint of the robot and minimum and maximum distance from the center of the robot to its footprint vertices.
-    footprint_spec_ = costmap_ros_->getRobotFootprint();
-    costmap_2d::calculateMinAndMaxDistances(footprint_spec_, robot_inscribed_radius_, robot_circumscribed_radius);    
+    // Get the ROS footprint(s) of the robot. The priority is as follows:
+    //   * If the footprints are provided in this node's params, use them. This will unconditionally disable dynamic footprint.
+    //   * Otherwise, fallback to using the footprint provided by the navigation stack (costmap).
+    if (maybeFillRosFootprintFromParam(nh, "ros_footprints", footprint_specs_)) {
+      ROS_INFO("Using provided footprint(s) for feasibility check. Forcing `is_footprint_dynamic` to false.");
+      cfg_.robot.is_footprint_dynamic = false;
+    } else {
+      ROS_INFO("Using costmap footprint for feasibility check.");
+      FootprintSpecRos spec;
+      spec.contour = costmap_ros_->getRobotFootprint();
+      footprint_specs_.push_back(spec);
+    }
+    assert(footprint_specs_.size() > 0);
+
+    // Populate the minimum and maximum distance from the center of each footprint to its contour.
+    for (auto& spec : footprint_specs_) {
+      costmap_2d::calculateMinAndMaxDistances(spec.contour, spec.robot_inscribed_radius, spec.robot_circumscribed_radius);
+    }
     
     // init the odom helper to receive the robot's velocity from odom messages
     odom_helper_.setOdomTopic(cfg_.odom_topic);
@@ -160,7 +175,7 @@ void TebLocalPlannerROS::initialize(std::string name, tf::TransformListener* tf,
     dynamic_recfg_->setCallback(cb);
     
     // validate optimization footprint and costmap footprint
-    validateFootprints(robot_model->getInscribedRadius(), robot_inscribed_radius_, cfg_.obstacles.min_obstacle_dist);
+    validateFootprints(robot_model->getInscribedRadius(), footprint_specs_[0].robot_inscribed_radius, cfg_.obstacles.min_obstacle_dist);
         
     // setup callback for custom obstacles
     custom_obst_sub_ = nh.subscribe("obstacles", 1, &TebLocalPlannerROS::customObstacleCB, this);
@@ -338,25 +353,29 @@ bool TebLocalPlannerROS::computeVelocityCommands(geometry_msgs::Twist& cmd_vel)
   if(cfg_.robot.is_footprint_dynamic)
   {
     // Update footprint of the robot and minimum and maximum distance from the center of the robot to its footprint vertices.
-    footprint_spec_ = costmap_ros_->getRobotFootprint();
-    costmap_2d::calculateMinAndMaxDistances(footprint_spec_, robot_inscribed_radius_, robot_circumscribed_radius);
+    footprint_specs_[0].contour = costmap_ros_->getRobotFootprint();
+    costmap_2d::calculateMinAndMaxDistances(footprint_specs_[0].contour, footprint_specs_[0].robot_inscribed_radius, footprint_specs_[0].robot_circumscribed_radius);
   }
 
-  bool feasible = planner_->isTrajectoryFeasible(costmap_model_.get(), footprint_spec_, robot_inscribed_radius_, robot_circumscribed_radius, cfg_.trajectory.feasibility_check_no_poses);
-  if (!feasible)
+  // Evaluate feasibility on all footprints
+  for (const auto& spec : footprint_specs_)
   {
-    cmd_vel.linear.x = 0;
-    cmd_vel.linear.y = 0;
-    cmd_vel.angular.z = 0;
-   
-    // now we reset everything to start again with the initialization of new trajectories.
-    planner_->clearPlanner();
-    ROS_WARN("TebLocalPlannerROS: trajectory is not feasible. Resetting planner...");
-    
-    ++no_infeasible_plans_; // increase number of infeasible solutions in a row
-    time_last_infeasible_plan_ = ros::Time::now();
-    last_cmd_ = cmd_vel;
-    return false;
+    bool feasible = planner_->isTrajectoryFeasible(costmap_model_.get(), spec.contour, spec.robot_inscribed_radius, spec.robot_circumscribed_radius, cfg_.trajectory.feasibility_check_no_poses);
+    if (!feasible)
+    {
+      cmd_vel.linear.x = 0;
+      cmd_vel.linear.y = 0;
+      cmd_vel.angular.z = 0;
+
+      // now we reset everything to start again with the initialization of new trajectories.
+      planner_->clearPlanner();
+      ROS_WARN("TebLocalPlannerROS: trajectory is not feasible. Resetting planner...");
+
+      ++no_infeasible_plans_; // increase number of infeasible solutions in a row
+      time_last_infeasible_plan_ = ros::Time::now();
+      last_cmd_ = cmd_vel;
+      return false;
+    }
   }
 
   // Get the velocity command for this sampling interval
@@ -1096,6 +1115,44 @@ RobotFootprintModelPtr TebLocalPlannerROS::getRobotFootprintFromParamServer(cons
     }
     
   }
+
+  ROS_INFO_STREAM("Model name: " << model_name);
+
+  // ski lines
+  if (model_name.compare("ski_lines") == 0)
+  {
+    // check parameters
+    if (!nh.hasParam("footprint_model/line_start") || !nh.hasParam("footprint_model/line_end")
+        || !nh.hasParam("footprint_model/line_separation"))
+    {
+      ROS_ERROR_STREAM("Footprint model 'ski_lines' cannot be loaded for trajectory optimization, since param '" << nh.getNamespace() 
+                       << "/footprint_model/line_start' and/or '.../line_end' and/or '.../line_separation' do not exist. Using point-model instead.");
+      return boost::make_shared<PointRobotFootprint>();
+    }
+    // get line coordinates
+    std::vector<double> line_start, line_end;
+    if (!nh.getParam("footprint_model/line_start", line_start)) {
+      ROS_ERROR_STREAM("Failed to load line_start");
+    }
+    if (!nh.getParam("footprint_model/line_end", line_end)) {
+      ROS_ERROR_STREAM("Failed to load line_end");
+    }
+    if (line_start.size() != 2 || line_end.size() != 2)
+    {
+      ROS_ERROR_STREAM("Footprint model 'ski_lines' cannot be loaded for trajectory optimization, since param '" << nh.getNamespace() 
+                       << "/footprint_model/line_start' and/or '.../line_end' do not contain x and y coordinates (2D). Using point-model instead.");
+      return boost::make_shared<PointRobotFootprint>();
+    }
+    // get line separation
+    double line_separation;
+    nh.getParam("footprint_model/line_separation", line_separation);
+    
+    ROS_INFO_STREAM("Footprint model 'ski_lines' (line_start: [" << line_start[0] << "," << line_start[1] <<"]m, line_end: ["
+                     << line_end[0] << "," << line_end[1] << "]m, line_separation: " << line_separation << ") loaded for trajectory optimization.");
+    return boost::make_shared<SkiRobotFootprint>(Eigen::Map<const Eigen::Vector2d>(line_start.data()), Eigen::Map<const Eigen::Vector2d>(line_end.data()), line_separation);
+  
+
+  }
   
   // otherwise
   ROS_WARN_STREAM("Unknown robot footprint model specified with parameter '" << nh.getNamespace() << "/footprint_model/type'. Using point model instead.");
@@ -1154,6 +1211,62 @@ double TebLocalPlannerROS::getNumberFromXMLRPC(XmlRpc::XmlRpcValue& value, const
      throw std::runtime_error("Values in the footprint specification must be numbers");
    }
    return value.getType() == XmlRpc::XmlRpcValue::TypeInt ? (int)(value) : (double)(value);
+}
+
+bool TebLocalPlannerROS::maybeFillRosFootprintFromParam(const ros::NodeHandle& nh, const std::string& param_name, std::vector<FootprintSpecRos>& footprint_specs)
+{
+  if (!nh.hasParam(param_name))
+  {
+    return false;
+  }
+
+  XmlRpc::XmlRpcValue footprints_xmlrpc;
+  if (!nh.getParam(param_name, footprints_xmlrpc) )
+  {
+    ROS_ERROR_STREAM("Failed to get ROS footprint param " << param_name);
+    return false;
+  }
+
+  // get the list of list of vertices (3d list)
+  if (footprints_xmlrpc.getType() == XmlRpc::XmlRpcValue::TypeArray)
+  {
+    for (int i = 0; i < footprints_xmlrpc.size(); ++i)
+    {
+      std::stringstream item_name(param_name);
+      item_name << "[" << i << "]";
+      if (footprints_xmlrpc[i].getType() == XmlRpc::XmlRpcValue::TypeArray)
+      {
+        try
+        {
+          Point2dContainer polygon = makeFootprintFromXMLRPC(footprints_xmlrpc[i], item_name.str());
+          FootprintSpecRos spec;
+          for (const auto& p : polygon) {
+            geometry_msgs::Point ros_point;
+            ros_point.x = p.x();
+            ros_point.y = p.y();
+            spec.contour.push_back(ros_point);
+          }
+          footprint_specs.push_back(spec);
+        }
+        catch (const std::exception& ex)
+        {
+          ROS_ERROR_STREAM("Failed to load ROS footprint at " << item_name.str() << " due to exception: " << ex.what());
+          return false;
+        }
+      }
+      else
+      {
+        ROS_ERROR_STREAM("Failed to load ROS footprint because " << item_name.str() << " is not a list");
+        return false;
+      }
+    }
+  }
+  else
+  {
+    ROS_ERROR_STREAM("Failed to load ROS footprint because " << param_name << " is not a list");
+    return false;
+  }
+
 }
 
 } // end namespace teb_local_planner

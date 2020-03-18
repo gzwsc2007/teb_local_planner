@@ -349,6 +349,22 @@ protected:
 
   
 private:
+  struct FootprintSpecRos {
+    std::vector<geometry_msgs::Point> contour; //!< Store the contour of this footprint
+    double robot_inscribed_radius; //!< The radius of the inscribed circle of this footprint (collision possible)
+    double robot_circumscribed_radius; //!< The radius of the circumscribed circle of this footprint
+  };
+
+  /**
+   * @brief Helper to populate footprint contours from the provided list of list of points. Returns
+   * @param nh Node handle
+   * @param param_name Name of the footprint param
+   * @param footprint_specs A vector of FootprintSpecRos to be filled
+   * @return whether the footprint was successfully filled
+   */
+  bool maybeFillRosFootprintFromParam(const ros::NodeHandle& nh, const std::string& param_name, std::vector<FootprintSpecRos>& footprint_specs);
+
+
   // Definition of member variables
 
   // external objects (store weak pointers)
@@ -391,9 +407,7 @@ private:
   RotType last_preferred_rotdir_; //!< Store recent preferred turning direction
   geometry_msgs::Twist last_cmd_; //!< Store the last control command generated in computeVelocityCommands()
   
-  std::vector<geometry_msgs::Point> footprint_spec_; //!< Store the footprint of the robot 
-  double robot_inscribed_radius_; //!< The radius of the inscribed circle of the robot (collision possible)
-  double robot_circumscribed_radius; //!< The radius of the circumscribed circle of the robot
+  std::vector<FootprintSpecRos> footprint_specs_; //!< Store the footprint(s) of the robot. There can be multiple disjoint footprints associated with the same robot (e.g. ski-like split configuration).
   
   std::string global_frame_; //!< The frame in which the controller will run
   std::string robot_base_frame_; //!< Used as the base frame id of the robot

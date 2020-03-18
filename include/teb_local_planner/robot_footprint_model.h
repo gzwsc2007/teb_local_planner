@@ -493,7 +493,9 @@ public:
     line_end_world.z = 0;
     marker.points.push_back(line_end_world);
 
-    marker.scale.x = 0.05; 
+    marker.scale.x = 0.05;
+    marker.scale.y = 0.05; 
+    marker.scale.z = 0.05;
     marker.color = color;
   }
   
@@ -676,7 +678,69 @@ private:
 };
 
 
+class SkiRobotFootprint : public BaseRobotFootprintModel
+{
+public:
+  SkiRobotFootprint(const Eigen::Vector2d& mid_start, const Eigen::Vector2d& mid_end, double separation) 
+    : line_separation_distance_(separation) {
+    Eigen::Vector2d dir = mid_end - mid_start;
+    dir = dir.normalized();
 
+    // Find the vector that is orthogonal to the mid line vector.
+    Eigen::Vector2d ortho;
+    if (dir.y() != 0) {
+      ortho.x() = 1;
+      ortho.y() = -(ortho.x() * dir.x()) / dir.y();
+    } else if (dir.x() != 0) {
+      ortho.y() = 1;
+      ortho.x() = -(ortho.y() * dir.y()) / dir.x();
+    } else {
+      ROS_FATAL("The line footprint has identical start and end points.");
+    }
+
+    // This is the vector that can be added/subtracted onto the mid line points to get
+    // the two ski lines.
+    ortho = ortho.normalized() * (separation / 2.0);
+
+    // Construct the two ski lines
+    ski_line1_ = boost::make_shared<LineRobotFootprint>(mid_start + ortho, mid_end + ortho);
+    ski_line2_ = boost::make_shared<LineRobotFootprint>(mid_start - ortho, mid_end - ortho);
+  }
+
+  virtual double calculateDistance(const PoseSE2& current_pose, const Obstacle* obstacle) const
+  {
+    return std::min(ski_line1_->calculateDistance(current_pose, obstacle),
+                    ski_line2_->calculateDistance(current_pose, obstacle));
+  }
+
+  virtual double estimateSpatioTemporalDistance(const PoseSE2& current_pose, const Obstacle* obstacle, double t) const
+  {
+    return std::min(ski_line1_->estimateSpatioTemporalDistance(current_pose, obstacle, t),
+                    ski_line2_->estimateSpatioTemporalDistance(current_pose, obstacle, t));
+  }
+
+  virtual void visualizeRobot(const PoseSE2& current_pose, std::vector<visualization_msgs::Marker>& markers, const std_msgs::ColorRGBA& color) const
+  {
+    ski_line1_->visualizeRobot(current_pose, markers, color);
+    ski_line2_->visualizeRobot(current_pose, markers, color);
+  }
+  
+  /* This method is not well-defined for the two-line case because the lines are disjoint.
+     For now just return the radius of the circle sandwiched between the two lines (i.e. half
+     of the line separation distance).
+     This method is not used during path planning (only used for sanity checking against the costmap
+     footprint). So there is no real impact of returning a dummy value.
+  */
+  virtual double getInscribedRadius() 
+  {
+    return line_separation_distance_ / 2.0;
+  }
+
+private:
+  const double line_separation_distance_;
+  boost::shared_ptr<LineRobotFootprint> ski_line1_;
+  boost::shared_ptr<LineRobotFootprint> ski_line2_;
+};
 
 
 } // namespace teb_local_planner
